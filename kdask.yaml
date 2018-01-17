@@ -1,0 +1,5 @@
+image: gcr.io/tmbmicro/docker-pytorch
+cluster: your-gke-cluster-name
+project: your-gke-project-name
+notebook_browser: firefox
+notebook_password: some-password
