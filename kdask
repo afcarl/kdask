@@ -1,0 +1,294 @@
+#!/usr/bin/python
+
+import os
+import os.path
+import sys
+import argparse
+import tempfile
+import glob
+import yaml
+from jinja2 import Template
+
+config = None
+
+service_def = """
+apiVersion: v1
+kind: Service
+metadata:
+  name: interactive
+spec:
+  type: LoadBalancer
+  selector:
+    app: interactive
+  ports:
+  - name: http
+    port: 8888
+    targetPort: 8888
+    protocol: TCP
+  - name: www-scheduler
+    port: 8787
+    targetPort: 8787
+    protocol: TCP
+  - name: www-diagnostic
+    port: 8788
+    targetPort: 8788
+    protocol: TCP
+  - name: www-workers
+    port: 8789
+    targetPort: 8789
+    protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dask-scheduler
+spec:
+  selector:
+    app: interactive
+  ports:
+  - port: 8786
+    protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: salt
+spec:
+  selector:
+    app: interactive
+  ports:
+  - name: salt-1
+    port: 4505
+    targetPort: 4505
+    protocol: TCP
+  - name: salt-2
+    port: 4506
+    targetPort: 4506
+    protocol: TCP
+"""
+
+interactive_def = """
+apiVersion: v1
+kind: Pod
+metadata:
+  name: interactive
+  labels:
+    app: interactive
+spec:
+  containers:
+  - name: interactive
+    image: {{ image }}
+    command: ["jupyter"]
+    args: ["notebook", "--allow-root", "--ip=*", "--no-browser"]
+    ports:
+    - containerPort: 8888
+  - name: dask-scheduler
+    image: {{ image }}
+    command: ["dask-scheduler"]
+    ports:
+    - containerPort: 8786
+"""
+
+worker_def = """
+apiVersion: extensions/v1beta1
+kind: ReplicaSet
+metadata:
+  name: dask-worker
+  labels:
+    app: dask-worker
+spec:
+  selector:
+    matchLabels:
+      app: dask-worker
+  replicas: 5
+  template:
+    metadata:
+      labels:
+        app: dask-worker
+    spec:
+      containers:
+      - name: dask-worker
+        image: {{ image }}
+        command: ["dask-worker"]
+        args: ["--worker-port", "18786", "--nanny-port", "18787", "dask-scheduler:8786"]
+        ports:
+        - containerPort: 18786
+        - containerPort: 18787
+"""
+
+init_cmds = """
+gcloud config set project {{ project }}
+gcloud config set compute/zone us-west1-a
+gcloud container clusters create {{ cluster }}
+gcloud container clusters get-credentials {{ cluster }}
+"""
+
+ke_ssh = """\
+#!/bin/bash
+pod=$1;shift;kubectl exec -i $pod -- "$@" 2>/dev/null
+"""
+
+def run(cmd):
+    print "#", cmd
+    assert os.system(cmd) == 0, cmd
+
+def runcmd(cmd, data):
+    print "#", cmd
+    # print data
+    with os.popen(cmd, "w") as stream:
+        stream.write(data)
+
+def getcmd(cmd):
+    print "#", cmd
+    with os.popen(cmd, "r") as stream:
+        return stream.read()
+
+def find_on_path(files, path):
+    if isinstance(files, str):
+        files = files.split(":")
+    if isinstance(path, str):
+        path = path.split(":")
+    for dir in path:
+        for file in files:
+            fname = os.path.join(dir, file)
+            if os.path.exists(fname):
+                return fname
+    return None
+
+def cmd_start(args):
+    print "### service def"
+    runcmd("kubectl apply -f -", service_def)
+    print "### worker def"
+    runcmd("kubectl apply -f -", worker_def)
+    print "### interactive def"
+    runcmd("kubectl apply -f -", interactive_def)
+
+def cmd_restart(args):
+    runcmd("kubectl delete -f -", interactive_def)
+    runcmd("kubectl delete -f -", worker_def)
+    cmd_start(args)
+
+def cmd_init(args):
+    for cmd in init_cmds.strip().split("\n"):
+        run(cmd)
+    cmd_start(args)
+
+def cmd_kill(args):
+    cmd = Template("yes | gcloud container clusters delete {{ cluster }}").render(**config)
+    run(cmd)
+
+def cmd_monitor(args):
+    run("watch 'kubectl get pods; echo; kubectl get services'")
+
+def cmd_status(args):
+    run("kubectl get pods; echo; kubectl get services")
+
+def cmd_nworkers(args):
+    runcmd("kubectl apply -f -", worker_def)
+
+def write_file(path, contents, mode=0644):
+    print ">", path, repr(contents)
+    with open(path, "w") as stream:
+        stream.write(contents)
+    os.chmod(path, mode)
+
+def run_rsync(cmdline):
+    write_file("./.ke_ssh.sh", ke_ssh, 0755)
+    # cmd = "rsync -av --progress --stats -e ./.ke_ssh.sh "+cmdline
+    cmd = "rsync -a -e ./.ke_ssh.sh "+cmdline
+    run(cmd)
+
+def rsync_files(filelist, dest=".", source="."):
+    with tempfile.NamedTemporaryFile() as stream:
+        for fname in filelist:
+            stream.write("{}\n".format(fname))
+        stream.flush()
+        run_rsync("--files-from={} {} interactive:{}".format(stream.name, source, dest))
+        # run_rsync("*.py interactive:{}".format(stream.name, dest))
+
+def cmd_rsync(args):
+    if "rsync_patterns" not in config:
+        return
+    files = []
+    for pattern in config["rsync_patterns"]:
+        files += glob.glob(pattern)
+    print files
+    rsync_files(files)
+
+def cmd_exec(args):
+    run("kubectl exec interactive -c interactive -- " + " ".join(args.args))
+
+def cmd_all(args):
+    workers = ["interactive"] + get_workers()
+    for worker in workers:
+        run("kubectl exec '{}' -ti -- ".format(worker) +
+                  " ".join(args.args))
+
+def cmd_shell(args):
+    cmd_rsync(args)
+    run("kubectl exec interactive -c interactive -ti /bin/bash")
+
+def cmd_run(args):
+    cmd_rsync(args)
+    run("kubectl exec interactive -c interactive -ti -- " + " ".join(args.args))
+
+def get_workers():
+    with os.popen("kubectl get pods | awk '/dask-worker-/{print $1}'", "r") as stream:
+        workers = stream.read().split()
+    return workers
+
+def cmd_runinit(args):
+    for line in config.get("init", []):
+        run("kubectl exec interactive -ti -- {}".format(worker, line))
+
+def cmd_install(args):
+    workers = ["interactive"] + get_workers()
+    for line in config.get("install", []):
+        for worker in workers:
+            run("kubectl exec '{}' -- {}".format(worker, line))
+
+def cmd_notebook(args):
+    ip = getcmd("kubectl get services | awk '/^interactive/{print $4}'").strip()
+    browser = config.get("notebook_browser", "firefox")
+    run("{} http://{}:80/".format(browser, ip))
+
+def cmd_nbpass(args):
+    run("kubectl exec interactive -ti -- jupyter notebook password")
+
+if __name__=="__main__":
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(help='subcommand', dest="command")
+    pinit = subparsers.add_parser("init")
+    pkill = subparsers.add_parser("kill")
+    pstart = subparsers.add_parser("start")
+    pmonitor = subparsers.add_parser("monitor")
+    pstatus = subparsers.add_parser("status")
+    pnworkers = subparsers.add_parser("nworkers")
+    prestart = subparsers.add_parser("restart")
+    pshell = subparsers.add_parser("shell")
+    pruninit = subparsers.add_parser("runinit")
+    pnotebook = subparsers.add_parser("notebook")
+    pnbpass = subparsers.add_parser("nbpass")
+    pexec = subparsers.add_parser("exec")
+    pexec.add_argument("args", nargs="+")
+    prun = subparsers.add_parser("run")
+    prun.add_argument("args", nargs="+")
+    pall = subparsers.add_parser("all")
+    pall.add_argument("args", nargs="+")
+    prsync = subparsers.add_parser("rsync")
+    pinstall = subparsers.add_parser("install")
+    args = parser.parse_args()
+
+    initpath = os.path.expandvars(".:$HOME")
+    initpath = os.environ.get("KDASKPATH", initpath)
+    initfile = find_on_path("kdask.yaml:.kdask.yaml", initpath)
+    if initfile is None:
+        print "no kdask.yaml file found"
+        sys.exit(1)
+    with open(initfile) as stream:
+        config = yaml.load(stream)
+    service_def = Template(service_def).render(**config)
+    interactive_def = Template(interactive_def).render(**config)
+    worker_def = Template(worker_def).render(**config)
+    init_cmds = Template(init_cmds).render(**config)
+    exec "cmd_{}(args)".format(args.command)
