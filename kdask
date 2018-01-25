@@ -119,7 +119,7 @@ spec:
 init_cmds = """
 gcloud config set project {{ project }}
 gcloud config set compute/zone us-west1-a
-gcloud container clusters create {{ cluster }}
+gcloud container clusters create {{ cluster }} --scopes storage-rw,compute-rw
 gcloud container clusters get-credentials {{ cluster }}
 """
 
@@ -255,6 +255,12 @@ def cmd_notebook(args):
 def cmd_nbpass(args):
     run("kubectl exec interactive -ti -- jupyter notebook password")
 
+def cmd_push(args):
+    assert "/" not in args.local
+    assert "gcr.io" not in args.remote
+    run("docker tag {} gcr.io/{}".format(args.local, args.remote))
+    run("gcloud docker -- push gcr.io/{}".format(args.remote))
+
 if __name__=="__main__":
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(help='subcommand', dest="command")
@@ -277,6 +283,9 @@ if __name__=="__main__":
     pall.add_argument("args", nargs="+")
     prsync = subparsers.add_parser("rsync")
     pinstall = subparsers.add_parser("install")
+    ppush = subparsers.add_parser("push")
+    ppush.add_argument("local")
+    ppush.add_argument("remote")
     args = parser.parse_args()
 
     initpath = os.path.expandvars(".:$HOME")
