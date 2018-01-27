@@ -280,8 +280,10 @@ def cmd_install(args):
 
 def cmd_notebook(args):
     ip = getcmd("kubectl get services | awk '/^interactive/{print $4}'").strip()
+    url = getcmd("kubectl exec interactive -c interactive -- jupyter notebook list | grep http://").strip()
     browser = config.get("notebook_browser", "firefox")
-    run("{} http://{}:80/".format(browser, ip))
+    token_url = url.replace("localhost:8888", ip+":8888")
+    run("{} {}".format(browser, token_url))
 
 def cmd_nbdns(args):
     global dns_cmds
@@ -300,6 +302,17 @@ def cmd_push(args):
     assert "gcr.io" not in args.remote
     run("docker tag {} gcr.io/{}".format(args.local, args.remote))
     run("gcloud docker -- push gcr.io/{}".format(args.remote))
+
+def cmd_print(args):
+    print "\nservice_def\n"
+    print service_def
+    print "\ninteractive_def\n"
+    print interactive_def
+    print "\nworker_def\n"
+    print worker_def
+    print "\ninit_cmds\n"
+    print init_cmds
+
 
 if __name__=="__main__":
     parser = argparse.ArgumentParser()
