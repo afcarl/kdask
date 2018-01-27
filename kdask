@@ -7,6 +7,7 @@ import argparse
 import tempfile
 import glob
 import yaml
+import re
 from jinja2 import Template
 
 config = None
@@ -82,11 +83,28 @@ spec:
     args: ["notebook", "--allow-root", "--ip=*", "--no-browser"]
     ports:
     - containerPort: 8888
+    workingDir: /home/tmb
+    env:
+    - name: BROWSER
+      value: firefox
+    - name: HOME
+      value: /home/tmb
+    volumeMounts:
+      - name: tmb-volume
+        mountPath: /home/tmb
   - name: dask-scheduler
     image: {{ image }}
     command: ["dask-scheduler"]
     ports:
     - containerPort: 8786
+  securityContext:
+    runAsUser: 1000
+    fsGroup: 1000
+  volumes:
+    - name: tmb-volume
+      gcePersistentDisk:
+        pdName: tmb-disk
+        fsType: ext4
 """
 
 worker_def = """
@@ -100,7 +118,7 @@ spec:
   selector:
     matchLabels:
       app: dask-worker
-  replicas: 5
+  replicas: {{ nworkers or 5 }}
   template:
     metadata:
       labels:
@@ -119,8 +137,15 @@ spec:
 init_cmds = """
 gcloud config set project {{ project }}
 gcloud config set compute/zone us-west1-a
-gcloud container clusters create {{ cluster }} --scopes storage-rw,compute-rw
+gcloud container clusters create {{ cluster }} --scopes storage-rw,compute-rw --max-nodes-per-pool={{ max_nodes or 100 }} --enable-autoscaling --max-nodes={{ max_nodes or 100 }}
 gcloud container clusters get-credentials {{ cluster }}
+"""
+
+dns_cmds = """
+IPADDR=35.203.138.190
+gcloud dns record-sets transaction start --zone "{{ dns_zone }}"
+gcloud dns record-sets transaction add --delete-all-existing --zone "{{ dns_zone }}" --name "{{ dns_domain }}". --ttl {{ dns_ttl or 3600 }} --type A "{{ nb_addr }}"
+gcloud dns record-sets transaction execute --zone {{ dns_zone }}
 """
 
 ke_ssh = """\
@@ -163,9 +188,15 @@ def cmd_start(args):
     print "### interactive def"
     runcmd("kubectl apply -f -", interactive_def)
 
+def cmd_write(args):
+    write_file("service.yaml", service_def)
+    write_file("worker.yaml", worker_def)
+    write_file("interactive.yaml", interactive_def)
+
 def cmd_restart(args):
     runcmd("kubectl delete -f -", interactive_def)
     runcmd("kubectl delete -f -", worker_def)
+    run("sleep 5") # wait for deletion to take effect
     cmd_start(args)
 
 def cmd_init(args):
@@ -252,6 +283,15 @@ def cmd_notebook(args):
     browser = config.get("notebook_browser", "firefox")
     run("{} http://{}:80/".format(browser, ip))
 
+def cmd_nbdns(args):
+    global dns_cmds
+    ip = getcmd("kubectl get services | awk '/^interactive/{print $4}'").strip()
+    assert re.match(r"^[0-9.]+$", ip)
+    config["nb_addr"] = ip
+    dns_cmds = Template(dns_cmds).render(**config)
+    for cmd in dns_cmds.strip().split("\n"):
+        run(cmd)
+
 def cmd_nbpass(args):
     run("kubectl exec interactive -ti -- jupyter notebook password")
 
@@ -270,6 +310,7 @@ if __name__=="__main__":
     pmonitor = subparsers.add_parser("monitor")
     pstatus = subparsers.add_parser("status")
     pnworkers = subparsers.add_parser("nworkers")
+    pnworkers.add_argument("nworkers", type=int)
     prestart = subparsers.add_parser("restart")
     pshell = subparsers.add_parser("shell")
     pruninit = subparsers.add_parser("runinit")
@@ -283,6 +324,8 @@ if __name__=="__main__":
     pall.add_argument("args", nargs="+")
     prsync = subparsers.add_parser("rsync")
     pinstall = subparsers.add_parser("install")
+    pwrite = subparsers.add_parser("write")
+    pnbdns = subparsers.add_parser("nbdns")
     ppush = subparsers.add_parser("push")
     ppush.add_argument("local")
     ppush.add_argument("remote")
@@ -296,6 +339,8 @@ if __name__=="__main__":
         sys.exit(1)
     with open(initfile) as stream:
         config = yaml.load(stream)
+    if args.command=="nworkers":
+        config["nworkers"] = args.nworkers
     service_def = Template(service_def).render(**config)
     interactive_def = Template(interactive_def).render(**config)
     worker_def = Template(worker_def).render(**config)
